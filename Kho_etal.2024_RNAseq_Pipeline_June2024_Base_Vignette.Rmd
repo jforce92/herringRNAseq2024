@@ -1,0 +1,347 @@
+---
+title: "Kho_RNASeqAnalysis_BaseInfo"
+author: "James Kho"
+date: "28/5/2024"
+output:
+  pdf_document: default
+  html_document: default
+---
+#1. Load up all the packages
+```{r}
+library(tximport)
+library(readr)
+library(tximportData)
+library(DESeq2)
+library(GenomicFeatures)
+library(apeglm)
+setwd("D:/RNASeq_Herring")
+```
+
+#2. Importing files
+Next we import files using tximport. An example to make the sample table is shown in the below code:
+
+dir <- system.file("extdata", package="tximportData")
+samples <- read.table(file.path(dir,"samples.txt"), header=TRUE)
+samples$condition <- factor(rep(c("A","B"),each=3))
+rownames(samples) <- samples$run
+samples[,c("pop","center","run","condition")]
+
+Next we have to create a tx2gene table but to do this we have to convert our transcriptome (gff file format) to a txdb file. We do this by using "makeTxDBFromGFF()" command which is a command from GenomicFeatures. We obtained the gff3 file from ensembl (Make sure it is extracted).
+
+```{r}
+txdb <- makeTxDbFromGFF(file = "Charengus_transcriptome.gff3", dataSource = "ensemblgenomes", organism = "Clupea harengus")
+
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- select(txdb, k, "GENEID", "TXNAME")
+```
+
+One extra step I had to do was to add a ".1" to each of the name and geneIDs in the tx2gene dataframe since all my samples had this extra decimal. Alternatively you can also remove the .1 from each of your sample's quant files and I'd imagine it will have the same effect.
+
+```{r}
+tx2gene$TXNAME <- sub("$", ".1", tx2gene$TXNAME)
+tx2gene$GENEID <- sub("$", ".1", tx2gene$GENEID)
+
+```
+
+After preparing the tx2gene table, we prepare the rest of the components:
+
+For our purposes, we should be able to just import the table with the name of the samples + conditions.
+
+```{r}
+samples2 <- read.csv("samples_table_temp_Stage3_12h_2020only.csv", fileEncoding="UTF-8-BOM")
+```
+
+
+```{r}
+files <- file.path("RNA_quants", samples2$X, "quant.sf")
+names(files) <- samples2$X
+```
+
+Next we import the quantification from salmon into DEseq2:
+
+```{r}
+txi <- tximport(files, type="salmon", tx2gene=tx2gene)
+```
+
+Finally we construct a DEseq2 object from the txi object and sample info in samples2
+```{r}
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                   colData = samples2,
+                                   design = ~ condition )
+```
+
+Note: We receive a warning regarding conversion to factors using counts and avg transcript lengths from tximport. I suspect this is because I did not specify the levels of comparisons (i.e., untreated vs. treated), but the vignette said the comparisons will be based on alphabetical order of the levels which is already the correct specification so I have chosen to move past this warning for now.
+
+"The ddsTxi object here can then be used as dds in the following analysis steps."
+
+We can also pre-filter the results to reduce the memory size of the ddsTxi object and/or increase the speed of count modelling. However, since these results are exploratory and we may be dealing with a 0 vs. something situation in terms of transcript abundance, I have decided to skip pre-filtering for now and rely on indepenent filtering procedures in results(). The script for pre-filtering is as such:
+
+smallestGroupSize <- 10 #number of samples in the treatment which has the least no. of individuals
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+
+#3. Differential expression analysis
+
+"Results tables are generated using the function results, which extracts a results table with log2 fold changes, p values and adjusted p values. With no additional arguments to results, the log2 fold change and Wald test p value will be for the last variable in the design formula, and if this is a factor, the comparison will be the last level of this variable over the reference level (see previous note on factor levels). However, the order of the variables of the design do not matter so long as the user specifies the comparison to build a results table for, using the name or contrast arguments of results."
+
+Let's first generate the results table:
+
+```{r}
+dds <- DESeq(ddsTxi)
+res <- results(dds)
+res
+
+#or alternatively:
+#res <- results(dds, name="condition_treated_vs_untreated")
+#res <- results(dds, contrast=c("condition","treated","untreated"))
+```
+
+##3.1 Log fold change shrinkage for visualization and ranking
+
+Shrinking of effect size (LFC estimates) is useful for visualization and ranking of genes. 
+
+We provide the dds object and the name or number of the coefficient we want to shrink, where the number refers to the order of the coefficient as it appears in resultsNames(dds).
+
+***Make sure we install the package "apeglm" using bioconductor before doing the below chunk!!!
+
+```{r}
+resultsNames(dds)
+resLFC <- lfcShrink(dds, coef="condition_B_vs_A", type="apeglm", lfcThreshold = 1)
+#This is where we can normalize and introduce a threshold to filter out low counts. Start at 2 and work backwards. Look at the table after and check the P-value, it might be the case where there are too much data with significant P-value (in which case be more stringent with P-value) or the other extreme. This will be covered later.
+resLFC
+```
+
+We can then order the results table by the smallest p value:
+
+```{r}
+resOrdered <- res[order(res$pvalue),]
+```
+
+We can also summarize basic tallies using summary function:
+```{r}
+summary(res)
+```
+
+How many adjusted p-values were less than 0.1?
+```{r}
+sum(res$padj < 0.1, na.rm=TRUE)
+```
+by default the results function use an alpha of 0.1, but we can adjust the p value cutoff to another value i.e., 0.5:
+
+```{r}
+res05 <- results(dds, alpha=0.001)
+summary(res05)
+sum(res05$padj < 0.001, na.rm=TRUE)
+```
+
+There is also an additional package that implements Independent hypothesis weighting to optimize power but we did not employ this in the current analysis. For more info, please refer to the original vignette: https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#indfilt
+
+#3.2 Analyses using shrinkage estimator
+This is important as it is the main filtering method of DEseq2 that we will employ to manage the data and list of genes. Essentially the goal here is to obtain a list of genes with acceptable fold change (i.e., how down/upregulated are the genes in relation to each other) as well as significant p-value (using padj).To do this we refer back to section 3.0 specifically the chunk in line 101 where we use lfcshrink. 
+
+First we address the fold change. The argument lfcThreshold can be used to introduce a threshold for the log fold change values. This will remove any genes with low counts and retain those above the specificed threshold. We used 1 as a base value in most comparisons and 2 if there are too many genes that meet the criteria.
+
+Second, we use the padj value to set a threshold for the significance (i.e., line 106). Combined with the lfcThreshold function, we can filter out genes with low counts AND non-significant P-values.
+
+
+We now change the alpha threshold to 0.05 and order the transcripts.
+```{r}
+resOrdered05 <- res05[order(res05$padj),]
+resOrdered05
+```
+
+We output the this list into a csv so we can extract the results for Metascape:
+```{r}
+write.csv(as.data.frame(resOrdered05),
+          file="HerringRNA_temp_Stage3_12h_0.001results.csv")
+
+#These are all the transcripts that DESeq2 have ordered, but we want to only see the results using ONLY significant transcripts and to do that we have to remove those that are not significant.
+```
+
+Use subset to ONLY keep those transcripts that have a specific alpha value. Make sure all the data is ordered before doing the codes below. We first start by ouputting a heatmap and then PCA:
+```{r}
+resSig05 <- subset(resOrdered05, padj < 0.001)
+write.csv(as.data.frame(resSig05),
+           file="HerringRNA_temp_Stage3_12h_Sig0.001results.csv")
+
+```
+
+We can do plotMA to check that we have indeed eliminated all the noise and kept only those that are significant.
+```{r}
+plotMA(resSig05, ylim=c(-2,2))
+```
+
+We can first transform the data to remove dependence of the variance on the mean. Two transformation methods exist in DESeq2: variance stabilizing transformations (VST) and regularized logarithm (rlog). Both produce transformed data on log2 scale which has been normalized with respect to library size or other normalization factors.
+
+We can extract the transformed values using the below function. 
+
+```{r}
+vsd <- vst(dds, blind=FALSE)
+rld <- rlog(dds, blind=FALSE)
+head(assay(vsd), 3)
+```
+Finally, we transform this dataset so we can visualize it through multiple plots.
+```{r}
+deseq2VST <- assay(vsd)
+deseq2VST <- as.data.frame(deseq2VST)
+deseq2VST$Gene <- rownames(deseq2VST)
+head(deseq2VST)
+```
+
+#4. Exploring and exporting results
+
+We can show the log2 fold changes attributable to a given variable over the mean of normalized counts for all samples. Blue points refer to those that are less than 0.1, indicating significance. 
+
+```{r}
+plotMA(resSig05, ylim=c(-2,2))
+```
+
+However it is more useful to visualize this MA-Plot for the shrunken log2 fold, thereby removing the noise associated with log2 fold changes from low count genes without any arbitrary filtering thresholds.
+
+```{r}
+plotMA(resLFC, ylim=c(-4,4))
+```
+
+After calling plotMA, one can use the function identify to interactively detect the row number of individual genes by clicking on the plot. One can then recover the gene identifiers by saving the resulting indices:
+
+
+idx <- identify(res$baseMean, res$log2FoldChange)
+rownames(res)[idx]
+
+
+There are alternative shrinkage estimators (normal and ashr), however the normal prior can produce too strong of shrinkage for certain datasets and the adaptive shrikange estimator uses a nromal distribution.
+
+##4.1 Plot counts
+
+Plotting counts of reads for a single gene across the groups can be done using "plotCounts" which normalizes counts by the estimated size factors/normalization factors, and adds a pseudocount of 1/2 to allow for log scale plotting. The variables are indicated in "intgroup" where more than one can be specified. 
+
+Below we select a gene which had the smallest p-value from the results table. 
+
+```{r}
+plotCounts(dds, gene=which.min(resSig05$padj), intgroup="condition")
+```
+
+We can also use ggplot by using the argument returnData:
+
+```{r}
+d <- plotCounts(dds, gene=which.min(resSig05$padj), intgroup="condition", 
+                returnData=TRUE)
+library("ggplot2")
+gcount <- ggplot(d, aes(x=condition, y=count)) + 
+  geom_point(position=position_jitter(w=0.1,h=0)) + 
+  scale_y_log10(breaks=c(25,100,400))
+
+gcount + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+Info on results column such as which variables/tests were used can be found by using the following function:
+
+mcols(res)$description
+
+#5. Data transformations and visualizations
+
+After transforming the data, we can plot the standard deviation of the transformed data across samples, against the mean, using both of the transformed data.
+
+***Make sure the package vsn is installed via biocmanager!
+
+```{r}
+ntd <- normTransform(dds)
+library("vsn")
+meanSdPlot(assay(ntd))
+meanSdPlot(assay(vsd))
+meanSdPlot(assay(rld))
+```
+#6.0 More visualization of data
+
+```{r}
+library(reshape2)
+library(viridis)
+library(scales)
+
+#Below we single out the analysis to only use genes that are significant in the dds/vsd through p-value (0.05) and logFoldChange (2)
+deseq2ResDF <- as.data.frame(resOrdered05)
+sigGenes <- rownames(deseq2ResDF[deseq2ResDF$padj <= .001 & abs(deseq2ResDF$log2FoldChange) > 2,])
+deseq2VST <- deseq2VST[deseq2VST$Gene %in% sigGenes,]
+deseq2VST_wide <- deseq2VST
+deseq2VST_long <- melt(deseq2VST, id.vars=c("Gene"))
+deseq2VST <- melt(deseq2VST, id.vars=c("Gene"))
+```
+
+Now we make the heatmap by using ggplot:
+```{r}
+heatmap <- ggplot(deseq2VST, aes(x=variable, y=Gene, fill=value)) + geom_raster() + scale_fill_viridis(trans="sqrt") + theme(axis.text.x=element_text(angle=65, hjust=1), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+heatmap
+```
+
+##6.1 Heatmap of count matrix
+
+Now to explore count matrix, we can use a heatmap for better visualization:
+Below, the "stage" can be substituted for different treatments or even years if we are comparing both 2019 and 2020 samples for example.
+
+```{r}
+library("pheatmap")
+select <- order(rowMeans(counts(dds,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(dds)[,c("condition","year")])
+```
+
+Using "vsd"
+```{r}
+pheatmap(assay(vsd)[select,], cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=FALSE, annotation_col=df)
+```
+
+
+##6.2 Heatmap of the sample-to-sample distances
+
+Here we cluster samples by applying the dist function to the transpose of the transformed count matrix to get sample-to-sample distances and then create a heatmap to visualize these distances.
+
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+```
+
+Then to create the heatmap:
+
+```{r}
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$condition, vsd$year, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+
+This heatmap shows how similar the samples are between each other. We provide a hierarchical clustering hc to the heatmap function based on the sample distances.
+
+#5.3 Principal component plot of samples
+
+Finally we can also do a PCA which shows the clustering of the samples:
+
+```{r}
+de <- rownames(resOrdered05[resOrdered05$padj<0.001 & !is.na(resOrdered05$padj), ]) #We first create a subset parameter to isolate significant genes for the pca.
+plotPCA(vsd[de,], intgroup=c("condition", "year"))
+```
+
+
+We can also create one using ggplot2:
+
+```{r}
+pcaData <- plotPCA(vsd[de,], intgroup=c("condition", "year"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=condition, shape=year)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()
+```
+
+
+For more information on processing the data, see: 
+https://genviz.org/module-04-expression/0004/02/01/DifferentialExpression/
+https://lashlock.github.io/compbio/R_presentation.html
+
+
