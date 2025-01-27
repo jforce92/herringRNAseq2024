@@ -1,0 +1,759 @@
+---
+title: "WGCNA_Network_analysis-RNASeq_temp_6h_2019"
+author: "James Kho"
+date: "1/18/2025"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Purpose of this analysis
+
+In this document, we use weighted gene co-expression network analysis (WGCNA) to identify co-expressed gene modules across treatments using data from the temperature comparisons between Atlantic Herring larvae in 2019 at 6h photoperiod [@Langfelder2008].
+WGCNA uses a series of correlations to identify sets of genes that are expressed together in your data set. 
+This is a fairly intuitive approach to gene network analysis which can aid in interpretation of microarray & RNA-seq data. 
+
+As output, WGCNA gives groups of co-expressed genes as well as an eigengene x sample matrix (where the values for each eigengene represent the summarized expression for a group of co-expressed genes) [@Langfelder2007]. 
+This eigengene x sample data can, in many instances, be used as you would the original gene expression values. 
+In this example, we use eigengene x sample data to identify differentially expressed modules between our treatment and control group
+
+This method does require some computing power, but can still be run locally (on your own computer) for most refine.bio datasets.
+As with many clustering and network methods, there are some parameters that may need tweaking. 
+
+
+Note that I did my own tweaking to the existing vignette for WGCNA, for information on the packagem refer to ['Getting Started' section](https://alexslemonade.github.io/refinebio-examples/01-getting-started/getting-started.html#how-this-tutorial-is-structured).
+We recommend taking a look at our [Resources for Learning R](https://alexslemonade.github.io/refinebio-examples/01-getting-started/getting-started.html#resources-for-learning-r) if you have not written code in R before. 
+
+This document is adapted from the example rmd file: [download the `.Rmd` for this analysis by clicking this link](https://alexslemonade.github.io/refinebio-examples/04-advanced-topics/network-analysis_rnaseq_01_wgcna.Rmd).
+
+## Set up your analysis folders 
+
+Good file organization is helpful for keeping your data analysis project on track!
+We have set up some code that will automatically set up a folder structure for you. 
+Run this next chunk to set up your folders! 
+
+If you have trouble running this chunk, see our [introduction to using `.Rmd`s](https://alexslemonade.github.io/refinebio-examples/01-getting-started/getting-started.html#how-to-get-and-use-rmds) for more resources and explanations. 
+
+```{r
+# Create the data folder if it doesn't exist
+if (!dir.exists("data")) {
+  dir.create("data")
+}
+
+# Define the file path to the plots directory
+plots_dir <- "plots"
+
+# Create the plots folder if it doesn't exist
+if (!dir.exists(plots_dir)) {
+  dir.create(plots_dir)
+}
+
+# Define the file path to the results directory
+results_dir <- "results"
+
+# Create the results folder if it doesn't exist
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir)
+}
+```
+
+In the same place you put this `.Rmd` file, you should now have three new empty folders called `data`, `plots`, and `results`!
+
+##Setting up the Input file (taken from the rnaseq pipeline)
+
+#1. Load up all the packages
+```{r}
+setwd("D:/RNASeq")
+library(tximport)
+library(readr)
+library(tximportData)
+library(DESeq2)
+library(GenomicFeatures)
+library(tibble)
+library(ggplot2)
+library(WGCNA)
+```
+
+#2. Importing files
+Next we import files using tximport. For our purposes, we should be able to just import the table with the name of the samples + conditions so let's see...
+
+```{r}
+samples2 <- read.csv("samples_table_temp_6h_2019.csv", fileEncoding="UTF-8-BOM")
+```
+
+Next we have to create a tx2gene table but to do this we have to convert our transcriptome (gff file format) to a txdb file. We do this by using "makeTxDBFromGFF()" command which is a command from GenomicFeatures. We obtained the gff3 file from ensembl (Make sure it is extracted).
+
+```{r}
+txdb <- makeTxDbFromGFF(file = "Charengus_transcriptome.gff3", dataSource = "ensemblgenomes", organism = "Clupea harengus")
+
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- select(txdb, k, "GENEID", "TXNAME")
+```
+
+One extra step I had to do was to add a ".1" to each of the name and geneIDs in the tx2gene dataframe since all my samples had this extra decimal. Alternatively you can also remove the .1 from each of your sample's quant files and I'd imagine it will have the same effect.
+
+```{r}
+tx2gene$TXNAME <- sub("$", ".1", tx2gene$TXNAME)
+tx2gene$GENEID <- sub("$", ".1", tx2gene$GENEID)
+
+```
+
+After preparing the tx2gene table, we prepare the rest of the components:
+
+```{r}
+files <- file.path("RNA_quants", samples2$X, "quant.sf")
+names(files) <- samples2$X
+```
+
+Next we import the quantification from salmon into DEseq2:
+
+```{r}
+txi <- tximport(files, type="salmon", tx2gene=tx2gene)
+
+```
+Next, we want to manually filter the data for low counts. We need to do this before wgcna analysis as low counts can influence the power downstream. If I were to do the traditional results function using DESeq2, this would not be necessary as DESeq2 has an auto filter for low counts.
+
+```{r}
+
+# Bless Chatgpt for this.
+# Get the counts matrix
+counts_matrix <- txi$counts
+
+# Identify genes to keep based on rowSums for the counts matrix
+genes_to_keep <- rownames(counts_matrix[rowSums(counts_matrix) >= 50, ])
+
+# Filter all matrices in the txi object based on these genes
+txi$counts <- txi$counts[genes_to_keep, ]
+txi$abundance <- txi$abundance[genes_to_keep, ]
+txi$length <- txi$length[genes_to_keep, ]
+
+# Optional: Check dimensions to ensure consistency
+dim(txi$counts)
+dim(txi$abundance)
+dim(txi$length)
+
+```
+
+Finally we construct a DEseq2 object from the txi object and sample info in samples2
+```{r}
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                   colData = samples2,
+                                   design = ~ condition )
+```
+
+Note: We receive a warning regarding conversion to factors using counts and avg transcript lengths from tximport. I suspect this is because I did not specify the levels of comparisons (i.e., untreated vs. treated), but the vignette said the comparisons will be based on alphabetical order of the levels which is already the correct specification so I have chosen to move past this warning for now.
+
+"The ddsTxi object here can then be used as dds in the following analysis steps."
+
+We can also pre-filter the results to reduce the memory size of the ddsTxi object and/or increase the speed of count modelling. However, since these results are exploratory and we may be dealing with a 0 vs. something situation in terms of transcript abundance, I have decided to skip pre-filtering for now and rely on independent filtering procedures in results(). The script for pre-filtering is as such:
+
+smallestGroupSize <- 10 #number of samples in the treatment which has the least no. of individuals
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+
+#3. Differential expression analysis
+
+"Results tables are generated using the function results, which extracts a results table with log2 fold changes, p values and adjusted p values. With no additional arguments to results, the log2 fold change and Wald test p value will be for the last variable in the design formula, and if this is a factor, the comparison will be the last level of this variable over the reference level (see previous note on factor levels). However, the order of the variables of the design do not matter so long as the user specifies the comparison to build a results table for, using the name or contrast arguments of results."
+
+Let's first generate the results table:
+
+```{r}
+dds <- DESeq(ddsTxi)
+
+
+```
+
+
+
+# Identifying co-expression gene modules with WGCNA - RNA-seq
+
+## Install libraries
+
+We will be using `DESeq2` to normalize and transform our RNA-seq data before running WGCNA, so we will need to install that [@Love2014].
+
+Of course, we will need the `WGCNA` package [@Langfelder2008].
+But `WGCNA` also requires a package called `impute` that it sometimes has trouble installing so we recommend installing that first [@Hastie2020]. 
+
+For plotting purposes will be creating a `sina` plot and heatmaps which we will need a `ggplot2` companion package for, called `ggforce` as well as the `ComplexHeatmap` package [@Gu2020].  
+
+```{r
+if (!("DESeq2" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("DESeq2", update = FALSE)
+}
+
+if (!("impute" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  BiocManager::install("impute")
+}
+
+if (!("WGCNA" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("WGCNA")
+}
+
+if (!("ggforce" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+  install.packages("ggforce")
+}
+
+#if (!("ComplexHeatmap" %in% installed.packages())) {
+  # Install this package if it isn't installed yet
+library(devtools)
+install_github("jokergoo/ComplexHeatmap")
+```
+
+Attach some of the packages we need for this analysis.
+
+```{r message=FALSE}
+# Attach the DESeq2 library
+library(DESeq2)
+
+# We will need this so we can use the pipe: %>%
+library(magrittr)
+
+# We'll need this for finding gene modules
+library(WGCNA)
+
+# We'll be making some plots
+library(ggplot2)
+
+library(ComplexHeatmap)
+```
+
+
+
+### Prepare data for `DESeq2`
+
+One thing I needed to do was setting up our main experimental group variable. 
+Unfortunately the metadata for this dataset are not set up into separate, neat columns, but we can accomplish that ourselves. 
+
+For handier use of this information, we can create a new variable, `temperature`, that states this info more clearly. 
+This new `temperature` variable will have two labels: `11°C` and `13°C` based on the `A` or `B` coding located in the `condition` string variable. 
+
+```{r}
+metadata <- samples2 %>%
+  dplyr::mutate(
+    temperature = dplyr::case_when(
+      # Create our new variable based on refinebio_title containing AV/CV
+      stringr::str_detect(condition, "B") ~ "11°C",
+      stringr::str_detect(condition, "A") ~ "13°C"
+    ),
+    # It's easier for future items if this is already set up as a factor
+    temperature = as.factor(temperature)
+  )
+```
+
+Let's double check that our factor set up is right. 
+We want `11°C` to be the first level since it was the first time point collected. 
+
+```{r}
+levels(metadata$temperature)
+```
+
+Great! We're all set. 
+
+## Create a DESeqDataset
+
+We will be using the `DESeq2` package for [normalizing and transforming our data](https://alexslemonade.github.io/refinebio-examples/03-rnaseq/00-intro-to-rnaseq.html#deseq2-transformation-methods), which requires us to format our data into a `DESeqDataSet` object.
+We turn the data frame (or matrix) into a [`DESeqDataSet` object](https://alexslemonade.github.io/refinebio-examples/03-rnaseq/00-intro-to-rnaseq.html#02_About_DESeq2) and specify which variable labels our experimental groups using the [`design` argument](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#multi-factor-designs) [@Love2014].
+In this chunk of code, we will not provide a specific model to the `design` argument because we are not performing a differential expression analysis (that's my other pipeline!).
+
+*****************************I started here after creating the dds object from my original pipeline!!
+
+## Perform DESeq2 normalization and transformation
+
+We often suggest normalizing and transforming your data for various applications and in this instance WGCNA's authors [suggest using variance stabilizing transformation before running WGCNA](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/faq.html#:~:text=Can%20WGCNA%20be%20used%20to,Yes.&text=Whether%20one%20uses%20RPKM%2C%20FPKM,were%20processed%20the%20same%20way.).  
+We are going to use the `vst()` function from the `DESeq2` package to normalize and transform the data.
+For more information about these transformation methods, [see here](https://alexslemonade.github.io/refinebio-examples/03-rnaseq/00-intro-to-rnaseq.html#deseq2-transformation-methods). 
+
+```{r}
+# Normalize and transform the data in the `DESeqDataSet` object using the `vst()`
+# function from the `DESEq2` R package
+dds_norm <- vst(dds)
+```
+
+At this point, if your data set has any outlier samples, you should look into removing them as they can affect your WGCNA results. 
+
+WGCNA's tutorial has [an example of exploring your data for outliers you can reference](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/FemaleLiver-01-dataInput.pdf).
+
+For this example data set, we will skip this step (there are no obvious outliers) and proceed.
+
+## Format normalized data for WGCNA
+
+Extract the normalized counts to a matrix and transpose it so we can pass it to WGCNA. 
+
+```{r}
+# Retrieve the normalized data from the `DESeqDataSet`
+normalized_counts <- assay(dds_norm) %>%
+  t() # Transpose this data
+```
+
+## Determine parameters for WGCNA
+
+To identify which genes are in the same modules, WGCNA first creates a weighted network to define which genes are near each other. 
+The measure of "adjacency" it uses is based on the correlation matrix, but requires the definition of a threshold value, which in turn depends on a "power" parameter that defines the exponent used when transforming the correlation values. 
+The choice of power parameter will affect the number of modules identified, and the WGCNA modules provides the  `pickSoftThreshold()` function to help identify good choices for this parameter. 
+
+```{r}
+sft <- pickSoftThreshold(normalized_counts,
+  dataIsExpr = TRUE,
+  corFnc = cor,
+  networkType = "signed"
+)
+```
+
+This `sft` object has a lot of information, we will want to plot some of it to figure out what our `power` soft-threshold should be. 
+We have to first calculate a measure of the model fit, the signed $R^2$, and make that a new variable. 
+
+```{r}
+sft_df <- data.frame(sft$fitIndices) %>%
+  dplyr::mutate(model_fit = -sign(slope) * SFT.R.sq)
+```
+
+Now, let's plot the model fitting by the `power` soft threshold so we can decide on a soft-threshold for power. 
+
+```{r}
+ggplot(sft_df, aes(x = Power, y = model_fit, label = Power)) +
+  # Plot the points
+  geom_point() +
+  # We'll put the Power labels slightly above the data points
+  geom_text(nudge_y = 0.1) +
+  # We will plot what WGCNA recommends as an R^2 cutoff
+  geom_hline(yintercept = 0.80, col = "red") +
+  # Just in case our values are low, we want to make sure we can still see the 0.80 level
+  ylim(c(min(sft_df$model_fit), 1.05)) +
+  # We can add more sensible labels for our axis
+  xlab("Soft Threshold (power)") +
+  ylab("Scale Free Topology Model Fit, signed R^2") +
+  ggtitle("Scale independence") +
+  # This adds some nicer aesthetics to our plot
+  theme_classic()
+```
+
+Using this plot we can decide on a power parameter. 
+WGCNA's authors recommend using a `power` that has an signed $R^2$ above `0.80`, otherwise they warn your results may be too noisy to be meaningful. 
+
+If you have multiple power values with signed $R^2$ above `0.80`, then picking the one at an inflection point, in other words where the $R^2$ values seem to have reached their saturation [@Zhang2005].
+You want to a `power` that gives you a big enough $R^2$ but is not excessively large.
+
+So using the plot above, going with a power soft-threshold of `20`!
+
+If you find you have all very low $R^2$ values this may be because there are too many genes with low expression values that are cluttering up the calculations. 
+You can try returning to [gene filtering step](#define-a-minimum-counts-cutoff) and choosing a more stringent cutoff (you'll then need to re-run the transformation and subsequent steps to remake this plot to see if that helped). 
+
+## Run WGCNA!
+
+We will use the `blockwiseModules()` function to find gene co-expression modules in WGCNA, using `16` for the `power` argument like we determined above. 
+
+This next step takes some time to run.
+The `blockwise` part of the `blockwiseModules()` function name refers to that these calculations will be done on chunks of your data at a time to help with conserving computing resources.
+
+Here we are using the default `maxBlockSize`, 5000 but, you may want to adjust the `maxBlockSize` argument depending on your computer's memory.
+The authors of WGCNA recommend running [the largest block your computer can handle](https://peterlangfelder.com/2018/11/25/blockwise-network-analysis-of-large-data/) and they provide some approximations as to GB of memory of a laptop and what `maxBlockSize` it should be able to handle:
+
+> • If the reader has access to a large workstation with more than 4 GB of memory, the parameter maxBlockSize
+can be increased. A 16GB workstation should handle up to 20000 probes; a 32GB workstation should handle
+perhaps 30000. A 4GB standard desktop or a laptop may handle up to 8000-10000 probes, depending on
+operating system and other running programs.
+
+[@Langfelder2016]
+
+```{r}
+bwnet <- blockwiseModules(normalized_counts,
+  maxBlockSize = 5000, # What size chunks (how many genes) the calculations should be run in
+  TOMType = "signed", # topological overlap matrix
+  power = 16, # soft threshold for network construction
+  numericLabels = TRUE, # Let's use numbers instead of colors for module labels
+  randomSeed = 1234, # there's some randomness associated with this calculation
+  # so we should set a seed
+)
+```
+
+The `TOMtype` argument specifies what kind of topological overlap matrix (TOM) should be used to make gene modules.
+You can safely assume for most situations a `signed` network represents what you want -- we want WGCNA to pay attention to directionality. 
+However if you suspect you may benefit from an `unsigned` network, where positive/negative is ignored see [this article](https://peterlangfelder.com/2018/11/25/signed-or-unsigned-which-network-type-is-preferable/) to help you figure that out [@Langfelder2018].
+
+There are a lot of other settings you can tweak -- look at `?blockwiseModules` help page as well as the [WGCNA tutorial](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/) [@Langfelder2016].
+
+## Write main WGCNA results object to file
+
+We will save our whole results object to an RDS file in case we want to return to our original WGCNA results.
+
+```{r}
+readr::write_rds(bwnet,
+  file = file.path("results", "RNAseq_temp2019_6h_wgcna_results.RDS")
+)
+```
+
+## Explore our WGCNA results
+
+The `bwnet`  object has many parts, storing a lot of information. 
+We can pull out the parts we are most interested in and may want to use use for plotting. 
+
+In `bwnet` we have a data frame of eigengene module data for each sample in the `MEs` slot. 
+These represent the collapsed, combined, and normalized expression of the genes that make up each module. 
+
+```{r}
+module_eigengenes <- bwnet$MEs
+
+# Print out a preview
+head(module_eigengenes)
+```
+
+## Which modules have biggest differences across treatment groups?
+
+We can also see if our eigengenes relate to our metadata labels. 
+First we double check that our samples are still in order.
+
+```{r}
+all.equal(metadata$X, rownames(module_eigengenes))
+```
+
+```{r}
+# Create the design matrix from the `temperature` variable
+des_mat <- model.matrix(~ metadata$temperature)
+```
+
+Run linear model on each module.
+Limma wants our tests to be per row, so we also need to transpose so the eigengenes are rows
+
+```{r}
+# lmFit() needs a transposed version of the matrix
+fit <- limma::lmFit(t(module_eigengenes), design = des_mat)
+
+# Apply empirical Bayes to smooth standard errors
+fit <- limma::eBayes(fit)
+```
+
+Apply multiple testing correction and obtain stats in a data frame. 
+
+```{r}
+# Apply multiple testing correction and obtain stats
+stats_df <- limma::topTable(fit, number = ncol(module_eigengenes)) %>%
+  tibble::rownames_to_column("module")
+```
+
+Let's take a look at the results. 
+They are sorted with the most significant results at the top.
+
+```{r rownames.print = FALSE}
+head(stats_df)
+```
+
+Module 39 seems to be the most differentially expressed across `temperature` groups. 
+Now we can do some investigation into this module. 
+
+## Let's make plot of module 113
+
+As a sanity check, let's use `ggplot` to see what module 18's eigengene looks like between treatment groups. 
+
+First we need to set up the module eigengene for this module with the sample metadata labels we need. 
+
+```{r}
+module_113_df <- module_eigengenes %>%
+  tibble::rownames_to_column("sample_names") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(metadata %>%
+    dplyr::select(X, temperature),
+  by = c("sample_names" = "X")
+  )
+```
+
+Now we are ready for plotting. 
+
+```{r}
+ggplot(
+  module_113_df,
+  aes(
+    x = temperature,
+    y = ME113,
+    color = temperature
+  )
+) +
+  # a boxplot with outlier points hidden (they will be in the sina plot)
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  # A sina plot to show all of the individual data points
+  ggforce::geom_sina(maxwidth = 0.3) +
+  theme_classic()
+```
+
+This makes sense! 
+Looks like module 113 has elevated expression during the acute illness but not when recovering.
+
+## What genes are a part of module 113?
+
+If you want to know which of your genes make up a modules, you can look at the `$colors` slot. 
+This is a named list which associates the genes with the module they are a part of. 
+We can turn this into a data frame for handy use. 
+
+```{r}
+gene_module_key <- tibble::enframe(bwnet$colors, name = "gene", value = "module") %>%
+  # Let's add the `ME` part so its more clear what these numbers are and it matches elsewhere
+  dplyr::mutate(module = paste0("ME", module))
+```
+
+Now we can find what genes are a part of module 113. 
+
+```{r}
+gene_module_key %>%
+  dplyr::filter(module == "ME113")
+```
+
+Let's save this gene to module key to a TSV file for future use. 
+
+```{r}
+readr::write_tsv(gene_module_key,
+  file = file.path("results", "Temp2019_6h_wgcna_gene_to_module.tsv")
+)
+```
+
+## Make a custom heatmap function
+
+We will make a heatmap that summarizes our differentially expressed module.
+Because we will make a couple of these, it makes sense to make a custom function for making this heatmap. 
+
+```{r}
+make_module_heatmap <- function(module_name,
+                                expression_mat = normalized_counts,
+                                metadata_df = metadata,
+                                gene_module_key_df = gene_module_key,
+                                module_eigengenes_df = module_eigengenes) {
+  # Create a summary heatmap of a given module.
+  #
+  # Args:
+  # module_name: a character indicating what module should be plotted, e.g. "ME19"
+  # expression_mat: The full gene expression matrix. Default is `normalized_counts`.
+  # metadata_df: a data frame with refinebio_accession_code and temperature
+  #              as columns. Default is `metadata`.
+  # gene_module_key: a data.frame indicating what genes are a part of what modules. Default is `gene_module_key`.
+  # module_eigengenes: a sample x eigengene data.frame with samples as row names. Default is `module_eigengenes`.
+  #
+  # Returns:
+  # A heatmap of expression matrix for a module's genes, with a barplot of the
+  # eigengene expression for that module.
+
+  # Set up the module eigengene with its refinebio_accession_code
+  module_eigengene <- module_eigengenes_df %>%
+    dplyr::select(all_of(module_name)) %>%
+    tibble::rownames_to_column("X")
+
+  # Set up column annotation from metadata
+  col_annot_df <- metadata_df %>%
+    # Only select the treatment and sample ID columns
+    dplyr::select(X, temperature, stage) %>%
+    # Add on the eigengene expression by joining with sample IDs
+    dplyr::inner_join(module_eigengene, by = "X") %>%
+    # Arrange by patient and time point
+    dplyr::arrange(temperature, stage) %>%
+    # Store sample
+    tibble::column_to_rownames("X")
+
+  # Create the ComplexHeatmap column annotation object
+  col_annot <- ComplexHeatmap::HeatmapAnnotation(
+    # Supply treatment labels
+    temperature = col_annot_df$temperature,
+    # Add annotation barplot
+    module_eigengene = ComplexHeatmap::anno_barplot(dplyr::select(col_annot_df, module_name)),
+    # Pick colors for each experimental group in temperature
+    col = list(temperature = c("11°C" = "#33CCCC", "13°C" = "#990000"))
+  )
+
+  # Get a vector of the Ensembl gene IDs that correspond to this module
+  module_genes <- gene_module_key_df %>%
+    dplyr::filter(module == module_name) %>%
+    dplyr::pull(gene)
+
+  # Set up the gene expression data frame
+  mod_mat <- expression_mat %>%
+    t() %>%
+    as.data.frame() %>%
+    # Only keep genes from this module
+    dplyr::filter(rownames(.) %in% module_genes) %>%
+    # Order the samples to match col_annot_df
+    dplyr::select(rownames(col_annot_df)) %>%
+    # Data needs to be a matrix
+    as.matrix()
+
+  # Normalize the gene expression values
+  mod_mat <- mod_mat %>%
+    # Scale can work on matrices, but it does it by column so we will need to
+    # transpose first
+    t() %>%
+    scale() %>%
+    # And now we need to transpose back
+    t()
+
+  # Create a color function based on standardized scale
+  color_func <- circlize::colorRamp2(
+    c(-2, 0, 2),
+    c("#67a9cf", "#f7f7f7", "#ef8a62")
+  )
+
+  # Plot on a heatmap
+  heatmap <- ComplexHeatmap::Heatmap(mod_mat,
+    name = module_name,
+    # Supply color function
+    col = color_func,
+    # Supply column annotation
+    bottom_annotation = col_annot,
+    # We don't want to cluster samples
+    cluster_columns = FALSE,
+    # We don't need to show sample or gene labels
+    show_row_names = TRUE,
+    show_column_names = TRUE
+  )
+
+  # Return heatmap
+  return(heatmap)
+}
+```
+
+## Make module heatmaps
+
+Let's try out the custom heatmap function with module 113 (our most differentially expressed module).
+
+```{r}
+mod_113_heatmap <- make_module_heatmap(module_name = "ME113")
+
+# Print out the plot
+mod_113_heatmap
+```
+
+From the barplot portion of our plot, we can see `acute illness` samples tend to have higher expression values for the module 113 eigengene.
+In the heatmap portion, we can see how the individual genes that make up module 19 are overall higher than in the `recovering` samples. 
+
+We can save this plot to PNG.
+
+```{r}
+png(file.path("results", "Temp2019_6h_module_113_heatmap.png"))
+mod_113_heatmap
+dev.off()
+```
+
+For comparison, let's try out the custom heatmap function with a different, _not_ differentially expressed module. 
+
+```{r}
+mod_9_heatmap <- make_module_heatmap(module_name = "ME9")
+
+# Print out the plot
+mod_9_heatmap
+```
+
+
+```{r}
+module_9_df <- module_eigengenes %>%
+  tibble::rownames_to_column("sample_names") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(metadata %>%
+    dplyr::select(X, temperature),
+  by = c("sample_names" = "X")
+  )
+
+ggplot(
+  module_9_df,
+  aes(
+    x = temperature,
+    y = ME9,
+    color = temperature
+  )
+) +
+  # a boxplot with outlier points hidden (they will be in the sina plot)
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  # A sina plot to show all of the individual data points
+  ggforce::geom_sina(maxwidth = 0.3) +
+  theme_classic()
+```
+
+
+Save this plot also.
+
+```{r}
+png(file.path("results", "Temp2019_6h_module_9_heatmap.png"))
+mod_9_heatmap
+dev.off()
+```
+OTHER PLOTS
+
+```{r}
+module_43_df <- module_eigengenes %>%
+  tibble::rownames_to_column("sample_names") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(metadata %>%
+    dplyr::select(X, temperature),
+  by = c("sample_names" = "X")
+  )
+
+ggplot(
+  module_43_df,
+  aes(
+    x = temperature,
+    y = ME43,
+    color = temperature
+  )
+) +
+  # a boxplot with outlier points hidden (they will be in the sina plot)
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  # A sina plot to show all of the individual data points
+  ggforce::geom_sina(maxwidth = 0.3) +
+  theme_classic()
+```
+
+```{r}
+mod_43_heatmap <- make_module_heatmap(module_name = "ME43")
+
+# Print out the plot
+mod_43_heatmap
+```
+
+
+```{r}
+module_75_df <- module_eigengenes %>%
+  tibble::rownames_to_column("sample_names") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(metadata %>%
+    dplyr::select(X, temperature),
+  by = c("sample_names" = "X")
+  )
+
+ggplot(
+  module_75_df,
+  aes(
+    x = temperature,
+    y = ME75,
+    color = temperature
+  )
+) +
+  # a boxplot with outlier points hidden (they will be in the sina plot)
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  # A sina plot to show all of the individual data points
+  ggforce::geom_sina(maxwidth = 0.3) +
+  theme_classic()
+```
+
+
+```{r}
+mod_75_heatmap <- make_module_heatmap(module_name = "ME75")
+
+# Print out the plot
+mod_75_heatmap
+```
+
+# Resources for further learning
+
+- [WGCNA FAQ page](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/faq.html) [@Langfelder2016].
+- [WGCNA tutorial](https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/) [@Langfelder2016].
+- [WGCNA paper](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-9-559) [@Langfelder2008].
+- [ComplexHeatmap's tutorial guide](https://jokergoo.github.io/ComplexHeatmap-reference/book/) for more info on how to tweak the heatmaps [@Gu2020].
+
+# Session info
+
+At the end of every analysis, before saving your notebook, we recommend printing out your session info. 
+This helps make your code more reproducible by recording what versions of software and packages you used to run this. 
+
+```{r}
+# Print session info
+sessioninfo::session_info()
+```
+
+# References
